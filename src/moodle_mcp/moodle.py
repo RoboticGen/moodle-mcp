@@ -26,6 +26,7 @@ class APIFunction(Enum):
     )
     core_webservice_get_site_info = "core_webservice_get_site_info"
     core_enrol_get_users_courses = "core_enrol_get_users_courses"
+    core_course_get_courses = "core_course_get_courses"
     core_course_get_contents = "core_course_get_contents"
     mod_assign_get_assignments = "mod_assign_get_assignments"
     mod_assign_get_submission_status = "mod_assign_get_submission_status"

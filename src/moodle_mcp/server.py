@@ -150,6 +150,38 @@ def create_implementation_plan(assignid: int) -> api.ImplementationPlan:
     return api.create_implementation_plan(assignid)
 
 
+# ---------------------------------------------------------------------------
+# Site-wide tools (see the matching section in api.py)
+#
+# The tools above are scoped to courses the token's user is enrolled in. These
+# see the whole site. Read-only.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_all_courses(include_hidden: bool = True) -> list[api.SiteCourse]:
+    """Get every course on the Moodle site, not just enrolled ones. Includes hidden courses unless include_hidden is False. Use this instead of get_my_courses for site-wide questions"""
+    return api.get_all_courses(include_hidden)
+
+
+@mcp.tool()
+def get_all_assignments(courseid: int | None = None) -> list[api.SiteAssignment]:
+    """Get assignments from any course on the site, including courses the user is not enrolled in. Optionally filter to one course ID. Unlike get_assignments this is not limited to enrolled courses"""
+    return api.get_all_assignments(courseid)
+
+
+@mcp.tool()
+def get_all_deadlines(within_days: int | None = None) -> list[api.SiteDeadline]:
+    """Get upcoming assignment deadlines across every course on the site, sorted by due date. Optionally limit to the next N days"""
+    return api.get_all_deadlines(within_days)
+
+
+@mcp.tool()
+def search_site_materials(query: str) -> list[api.SearchResult]:
+    """Search course materials across every course on the site by query string. Site-wide counterpart to search_course_materials"""
+    return api.search_site_materials(query)
+
+
 def main():
     logger.info("Starting moodle-mcp server")
     mcp.run()
