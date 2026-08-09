@@ -11,3 +11,6 @@ wheels/
 
 output/
 .env
+
+# Local Claude Desktop config staging (contains a Moodle token)
+claude_desktop_config.staged.json
