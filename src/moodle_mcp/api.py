@@ -2215,6 +2215,239 @@ def create_implementation_plan(assignid: int) -> ImplementationPlan:
     }
 
 
+# ---------------------------------------------------------------------------
+# Site-wide tools
+#
+# Everything above answers "what about *my* courses?" and routes through
+# core_enrol_get_users_courses, so it only ever sees courses the token's user is
+# enrolled in. Where the token belongs to an admin or service account enrolled
+# in a handful of courses, most of the site stays invisible.
+#
+# These tools answer "what is on this Moodle?" instead. They build on
+# core_course_get_courses and core_course_get_contents, which are scoped by
+# capability rather than enrolment, so a token with course:view reads courses it
+# is not enrolled in, including hidden ones.
+#
+# Assignments are derived from course contents rather than
+# mod_assign_get_assignments, which *is* enrolment-scoped and silently returns
+# an empty list with warningcode 2 for non-enrolled courses.
+#
+# Types live in this section rather than the block at the top of the file to
+# keep the feature in one place and out of the way of upstream merges.
+# Read-only by design: nothing here writes to Moodle.
+# ---------------------------------------------------------------------------
+
+
+class SiteCourse(TypedDict):
+    id: int
+    fullname: str
+    shortname: str
+    categoryid: int
+    visible: int
+    format: str
+    startdate: int
+    enddate: int
+
+
+class SiteAssignment(TypedDict):
+    id: int | None
+    cmid: int
+    name: str
+    course_id: int
+    course_name: str
+    section: str
+    url: str
+    visible: int
+    opendate: int | None
+    duedate: int | None
+
+
+class SiteDeadline(TypedDict):
+    assignment_id: int | None
+    assignment_name: str
+    course_id: int
+    course_name: str
+    url: str
+    duedate: int
+    duedate_formatted: str
+    days_remaining: int
+
+
+def get_all_courses(include_hidden: bool = True) -> list[SiteCourse]:
+    data = get_moodle_api_data(APIFunction.core_course_get_courses)
+
+    to_json_file(data, "all_courses.json")
+
+    spec = {
+        "id": "id",
+        "fullname": "fullname",
+        "shortname": Coalesce("shortname", default=""),
+        "categoryid": Coalesce("categoryid", default=0),
+        "visible": Coalesce("visible", default=1),
+        "format": Coalesce("format", default=""),
+        "startdate": Coalesce("startdate", default=0),
+        "enddate": Coalesce("enddate", default=0),
+    }
+
+    courses = [
+        glom(course, spec)
+        for course in data
+        # Moodle returns the front page as a pseudo-course with format "site"
+        if course.get("format") != "site"
+        and (include_hidden or course.get("visible", 1))
+    ]
+    courses.sort(key=lambda c: c["id"])
+
+    logger.info(
+        f"Extracted {len(courses)} site courses (include_hidden={include_hidden})"
+    )
+    return courses
+
+
+def _get_course_sections_raw(courseid: int) -> list[dict]:
+    """Course contents with module dates intact.
+
+    get_course_content() projects modules down to a few fields, dropping the
+    `dates` and `instance` keys these tools need.
+    """
+    return get_moodle_api_data(
+        APIFunction.core_course_get_contents,
+        params={"courseid": str(courseid)},
+    )
+
+
+def _module_dates(module: dict) -> dict[str, int]:
+    """Index a module's date entries by dataid, e.g. {"duedate": 1719685800}."""
+    return {
+        d["dataid"]: d["timestamp"]
+        for d in module.get("dates") or []
+        if isinstance(d, dict) and d.get("dataid") and d.get("timestamp")
+    }
+
+
+def _resolve_courses(courseid: int | None) -> list[SiteCourse]:
+    courses = get_all_courses()
+    if courseid is None:
+        return courses
+
+    matched = [c for c in courses if c["id"] == courseid]
+    if not matched:
+        logger.warning(f"Course {courseid} not found on this site")
+    return matched
+
+
+def get_all_assignments(courseid: int | None = None) -> list[SiteAssignment]:
+    courses = _resolve_courses(courseid)
+    assignments: list[SiteAssignment] = []
+
+    for course in courses:
+        try:
+            sections = _get_course_sections_raw(course["id"])
+        except MoodleAPIError as e:
+            logger.warning(f"Skipping course {course['id']} in assignment scan: {e}")
+            continue
+
+        for section in sections:
+            for module in section.get("modules") or []:
+                if module.get("modname") != "assign":
+                    continue
+
+                dates = _module_dates(module)
+                assignments.append(
+                    {
+                        "id": module.get("instance"),
+                        "cmid": module.get("id"),
+                        "name": module.get("name") or "",
+                        "course_id": course["id"],
+                        "course_name": course["fullname"],
+                        "section": section.get("name") or "",
+                        "url": module.get("url") or "",
+                        "visible": module.get("visible", 1),
+                        "opendate": dates.get("allowsubmissionsfromdate"),
+                        "duedate": dates.get("duedate"),
+                    }
+                )
+
+    to_json_file(assignments, "all_assignments.json")
+    logger.info(f"Found {len(assignments)} assignments across {len(courses)} course(s)")
+    return assignments
+
+
+def get_all_deadlines(within_days: int | None = None) -> list[SiteDeadline]:
+    now = int(datetime.now(timezone.utc).timestamp())
+    cutoff = now + within_days * 86400 if within_days else None
+
+    deadlines: list[SiteDeadline] = []
+    for assignment in get_all_assignments():
+        duedate = assignment["duedate"]
+        if not duedate or duedate < now:
+            continue
+        if cutoff and duedate > cutoff:
+            continue
+
+        deadlines.append(
+            {
+                "assignment_id": assignment["id"],
+                "assignment_name": assignment["name"],
+                "course_id": assignment["course_id"],
+                "course_name": assignment["course_name"],
+                "url": assignment["url"],
+                "duedate": duedate,
+                "duedate_formatted": datetime.fromtimestamp(
+                    duedate, tz=timezone.utc
+                ).isoformat(),
+                "days_remaining": (duedate - now) // 86400,
+            }
+        )
+
+    deadlines.sort(key=lambda d: d["duedate"])
+    logger.info(f"Found {len(deadlines)} upcoming site-wide deadlines")
+    return deadlines
+
+
+def search_site_materials(query: str) -> list[SearchResult]:
+    """Search materials across every course on the site.
+
+    The enrolled-only counterpart is search_course_materials(). Same client-side
+    matching, because Moodle global search is an optional subsystem that is
+    disabled by default.
+    """
+    needle = query.lower().strip()
+    if not needle:
+        return []
+
+    results: list[SearchResult] = []
+    for course in get_all_courses():
+        try:
+            sections = _get_course_sections_raw(course["id"])
+        except MoodleAPIError as e:
+            logger.warning(f"Skipping course {course['id']} in site search: {e}")
+            continue
+
+        for section in sections:
+            section_name = section.get("name") or ""
+            for module in section.get("modules") or []:
+                name = module.get("name") or ""
+                filenames = [
+                    c.get("filename", "")
+                    for c in (module.get("contents") or [])
+                    if isinstance(c, dict)
+                ]
+                haystack = " ".join([name, section_name, *filenames]).lower()
+                if needle in haystack:
+                    results.append(
+                        {
+                            "title": name,
+                            "url": module.get("url") or "",
+                            "content": section_name,
+                            "course_name": course["fullname"],
+                        }
+                    )
+
+    logger.info(f"Site-wide search for '{query}' matched {len(results)} materials")
+    return results
+
+
 if __name__ == "__main__":
     upcoming_events = get_upcoming_events()
     to_json_file(upcoming_events, "upcoming_events.json")
